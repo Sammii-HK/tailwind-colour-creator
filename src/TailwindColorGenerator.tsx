@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import tinycolor from "tinycolor2";
 import { Copy, Check, Pipette } from "lucide-react";
 import { cn } from "./lib/utils";
 
@@ -9,67 +8,118 @@ const TAILWIND_COLOR_NAMES = [
   "sky", "violet", "fuchsia", "rose", "orange", "amber",
 ];
 
-// Derived from averaging Tailwind's official palettes (blue, red, green, amber, purple).
-// Each step defines how far to interpolate from the 500 base towards white (light side)
-// or towards black (dark side), plus a saturation multiplier relative to the input.
+// ── OKLCH colour science (zero dependencies, ported from gamut) ──────────────
+
+function srgbToLinear(c: number): number {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+function linearToSrgb(c: number): number {
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+function clamp01(v: number) { return Math.max(0, Math.min(1, v)); }
+
+function linearRgbToOklab(r: number, g: number, b: number): [number, number, number] {
+  const l_ = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m_ = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s_ = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+  ];
+}
+function oklabToLinearRgb(L: number, a: number, b: number): [number, number, number] {
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+  const l = l_ ** 3, m = m_ ** 3, s = s_ ** 3;
+  return [
+    +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+  ];
+}
+
+interface Oklch { l: number; c: number; h: number }
+
+function hexToOklch(hex: string): Oklch | null {
+  const clean = hex.replace("#", "");
+  if (clean.length !== 6) return null;
+  const r = srgbToLinear(parseInt(clean.slice(0, 2), 16) / 255);
+  const g = srgbToLinear(parseInt(clean.slice(2, 4), 16) / 255);
+  const b = srgbToLinear(parseInt(clean.slice(4, 6), 16) / 255);
+  const [L, a, bOk] = linearRgbToOklab(r, g, b);
+  const c = Math.sqrt(a * a + bOk * bOk);
+  let h = (Math.atan2(bOk, a) * 180) / Math.PI;
+  if (h < 0) h += 360;
+  return { l: L, c, h };
+}
+
+function isInGamut(l: number, c: number, h: number): boolean {
+  const rad = (h * Math.PI) / 180;
+  const [lr, lg, lb] = oklabToLinearRgb(l, c * Math.cos(rad), c * Math.sin(rad));
+  const eps = 0.001;
+  return lr >= -eps && lr <= 1 + eps && lg >= -eps && lg <= 1 + eps && lb >= -eps && lb <= 1 + eps;
+}
+
+// Binary search on chroma to find the sRGB gamut boundary
+function gamutClamp(l: number, c: number, h: number): [number, number, number] {
+  if (isInGamut(l, c, h)) return [l, c, h];
+  let lo = 0, hi = c;
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    if (isInGamut(l, mid, h)) lo = mid; else hi = mid;
+  }
+  return [l, (lo + hi) / 2, h];
+}
+
+function oklchToHex(l: number, c: number, h: number): string {
+  const rad = (h * Math.PI) / 180;
+  const [lr, lg, lb] = oklabToLinearRgb(l, c * Math.cos(rad), c * Math.sin(rad));
+  const r = Math.round(clamp01(linearToSrgb(lr)) * 255);
+  const g = Math.round(clamp01(linearToSrgb(lg)) * 255);
+  const b = Math.round(clamp01(linearToSrgb(lb)) * 255);
+  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
+}
+
+// ── Palette generation ───────────────────────────────────────────────────────
+//
+// lFactor: interpolates L from the base colour towards white (positive) or
+//          black (negative). Calibrated from Tailwind's actual OKLCH palettes.
+// cScale:  chroma multiplier. Lights are strongly desaturated; darks taper off.
+//          This is the main quality improvement over the HSL approach.
+
 const STEP_CONFIG = [
-  { step: "50",  lightPos: 0.93,  satMult: 1.06 },
-  { step: "100", lightPos: 0.85,  satMult: 1.07 },
-  { step: "200", lightPos: 0.72,  satMult: 1.09 },
-  { step: "300", lightPos: 0.53,  satMult: 1.09 },
-  { step: "400", lightPos: 0.26,  satMult: 1.06 },
-  { step: "500", lightPos: 0,     satMult: 1.00 },
-  { step: "600", lightPos: -0.15, satMult: 0.88 },
-  { step: "700", lightPos: -0.27, satMult: 0.86 },
-  { step: "800", lightPos: -0.40, satMult: 0.81 },
-  { step: "900", lightPos: -0.51, satMult: 0.73 },
-  { step: "950", lightPos: -0.73, satMult: 0.76 },
+  { step: "50",  lFactor:  0.935, cScale: 0.07 },
+  { step: "100", lFactor:  0.863, cScale: 0.20 },
+  { step: "200", lFactor:  0.715, cScale: 0.46 },
+  { step: "300", lFactor:  0.531, cScale: 0.77 },
+  { step: "400", lFactor:  0.256, cScale: 0.97 },
+  { step: "500", lFactor:  0,     cScale: 1.00 },
+  { step: "600", lFactor: -0.130, cScale: 0.81 },
+  { step: "700", lFactor: -0.268, cScale: 0.65 },
+  { step: "800", lFactor: -0.402, cScale: 0.46 },
+  { step: "900", lFactor: -0.501, cScale: 0.35 },
+  { step: "950", lFactor: -0.668, cScale: 0.21 },
 ];
 
-interface ColorPalette {
-  [key: string]: string;
-}
+interface ColorPalette { [key: string]: string }
 
-function clamp(v: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, v));
-}
-
-function generateTailwindPalette(baseColor: string): ColorPalette {
-  const base = tinycolor(baseColor);
-  if (!base.isValid()) return {};
-
-  const hsl = base.toHsl();
-  const baseH = hsl.h;
-  const baseS = hsl.s;
-  const baseL = hsl.l;
+function generateTailwindPalette(baseHex: string): ColorPalette {
+  const base = hexToOklch(baseHex);
+  if (!base) return {};
 
   return Object.fromEntries(
-    STEP_CONFIG.map(({ step, lightPos, satMult }) => {
-      let l: number;
-      if (lightPos >= 0) {
-        // Lighter than 500: interpolate from baseL towards 1.0 (white)
-        l = baseL + lightPos * (1.0 - baseL);
-      } else {
-        // Darker than 500: interpolate from baseL towards 0.0 (black)
-        l = baseL + lightPos * baseL;
-      }
-      l = clamp(l, 0.03, 0.98);
-
-      // Saturation: scale relative to input, clamped
-      const s = clamp(baseS * satMult, 0.0, 1.0);
-
-      // Subtle hue shift: darks shift ~4 degrees warm, lights shift ~2 degrees cool
-      // This mimics the hand-tuning in Tailwind's official palettes
-      let hueShift = 0;
-      if (lightPos < 0) {
-        hueShift = Math.abs(lightPos) * 5; // up to ~3.7 degrees for 950
-      } else if (lightPos > 0) {
-        hueShift = lightPos * -2; // up to ~-1.9 degrees for 50
-      }
-      const h = (baseH + hueShift + 360) % 360;
-
-      const color = tinycolor({ h, s, l });
-      return [step, color.toHexString()];
+    STEP_CONFIG.map(({ step, lFactor, cScale }) => {
+      // Relative L interpolation — 500 stays the exact input colour
+      const l = clamp01(
+        lFactor >= 0
+          ? base.l + lFactor * (1.0 - base.l)
+          : base.l + lFactor * base.l
+      );
+      const c = Math.max(0, base.c * cScale);
+      const [cl, cc, ch] = gamutClamp(l, c, base.h);
+      return [step, oklchToHex(cl, cc, ch)];
     })
   );
 }
